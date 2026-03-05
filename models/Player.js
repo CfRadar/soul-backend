@@ -15,6 +15,9 @@ const PlayerSchema = new mongoose.Schema(
     friendRequestsIn: [{ type: mongoose.Schema.Types.ObjectId, ref: "Player" }],
     friendRequestsOut: [{ type: mongoose.Schema.Types.ObjectId, ref: "Player" }],
 
+    // time trial - best survival time in milliseconds
+    bestTimeTrialMs: { type: Number, default: 0, min: 0 },
+
     // quick stats
     lastSeenAt: { type: Date, default: null },
   },

@@ -8,6 +8,7 @@ const authRoutes = require("./routes/auth");
 const meRoutes = require("./routes/me");
 const friendsRoutes = require("./routes/friends");
 const leaderboardRoutes = require("./routes/leaderboard");
+const timeTrialRoutes = require("./routes/timeTrial");
 
 require("dotenv").config();
 const { connectDB } = require("./db");
@@ -24,6 +25,7 @@ app.use("/auth", authRoutes);
 app.use("/me", meRoutes);
 app.use("/friends", friendsRoutes);
 app.use("/leaderboard", leaderboardRoutes);
+app.use("/time-trial", timeTrialRoutes);
 
 app.get("/", (_, res) => res.send("Soul Duel server running"));
 
@@ -38,23 +40,38 @@ function clamp0(n) {
   return Math.max(0, Number(n) || 0);
 }
 
-async function applyResult({ winnerPid, loserPid, mode }) {
+async function applyResult({ winnerPid, loserPid, mode, winnerSurvivalMs = 0, loserSurvivalMs = 0 }) {
   // ✅ friend match: NO rank changes
-  if (mode !== "ranked") return;
+  if (mode !== "ranked") return { winnerDelta: 0, loserDelta: 0 };
 
   const winner = await Player.findById(winnerPid);
   const loser = await Player.findById(loserPid);
-  if (!winner || !loser) return;
+  if (!winner || !loser) return { winnerDelta: 0, loserDelta: 0 };
+
+  // Performance-based rating calculation
+  // Normalize survival time to 0-1 range (0s=0, 60s+=1)
+  const winnerNormalized = Math.min(1, winnerSurvivalMs / 60000);
+  const loserNormalized = Math.min(1, loserSurvivalMs / 60000);
+
+  // Calculate bonus based on survival time
+  const winnerBonus = Math.round(winnerNormalized * 10); // 0-10
+  const loserMitigation = Math.round(loserNormalized * 10); // 0-10
+
+  // Apply rating changes
+  // Winner: +10 base + 0-10 bonus = 10-20
+  const winnerDelta = 10 + winnerBonus;
+  // Loser: -20 base - 0-10 mitigation = -20 to -10
+  const loserDelta = -(20 - loserMitigation);
 
   winner.wins = clamp0(winner.wins) + 1;
   loser.losses = clamp0(loser.losses) + 1;
-
-  winner.rating = clamp0(winner.rating) + 10;
-  loser.rating = clamp0(loser.rating) - 20;
-  if (loser.rating < 0) loser.rating = 0;
+  winner.rating = clamp0(winner.rating) + winnerDelta;
+  loser.rating = Math.max(0, clamp0(loser.rating) + loserDelta);
 
   await winner.save();
   await loser.save();
+
+  return { winnerDelta, loserDelta };
 }
 
 /**
@@ -75,11 +92,26 @@ async function endRoom({ roomId, loserSid, reason = "death" }) {
   const loserPid = r.playerIds[r.players.indexOf(loserSid)];
   const winnerPid = r.playerIds[r.players.indexOf(winnerSid)];
 
+  // Collect survival times (in milliseconds)
+  const winnerSurvivalMs = r.stats?.[winnerSid]?.survivalMs || 0;
+  const loserSurvivalMs = r.stats?.[loserSid]?.survivalMs || 0;
+
   // ✅ ranked only
   let winnerData = null;
   let loserData = null;
+  let winnerDelta = 0;
+  let loserDelta = 0;
   if (winnerPid && loserPid && r.mode === "ranked") {
-    await applyResult({ winnerPid, loserPid, mode: r.mode });
+    const result = await applyResult({
+      winnerPid,
+      loserPid,
+      mode: r.mode,
+      winnerSurvivalMs,
+      loserSurvivalMs,
+    });
+    winnerDelta = result.winnerDelta || 0;
+    loserDelta = result.loserDelta || 0;
+
     // Fetch updated player data
     const winnerPlayer = await Player.findById(winnerPid).lean();
     const loserPlayer = await Player.findById(loserPid).lean();
@@ -92,6 +124,7 @@ async function endRoom({ roomId, loserSid, reason = "death" }) {
         rank: getRank(winnerPlayer.rating || 0),
         wins: winnerPlayer.wins || 0,
         losses: winnerPlayer.losses || 0,
+        delta: winnerDelta,
       };
     }
     if (loserPlayer) {
@@ -103,8 +136,13 @@ async function endRoom({ roomId, loserSid, reason = "death" }) {
         rank: getRank(loserPlayer.rating || 0),
         wins: loserPlayer.wins || 0,
         losses: loserPlayer.losses || 0,
+        delta: loserDelta,
       };
     }
+  } else if (r.mode !== "ranked") {
+    // Friend matches: set delta to 0
+    winnerDelta = 0;
+    loserDelta = 0;
   }
 
   io.to(roomId).emit("game:matchOver", {
@@ -116,6 +154,8 @@ async function endRoom({ roomId, loserSid, reason = "death" }) {
     mode: r.mode,
     winner: winnerData,
     loser: loserData,
+    winnerDelta,
+    loserDelta,
   });
 
   setTimeout(() => rooms.delete(roomId), 15000);
@@ -230,6 +270,7 @@ io.on("connection", (socket) => {
         state: "found",
         seed,
         mode: "ranked",
+        stats: {},
       });
 
       io.sockets.sockets.get(p1)?.join(roomId);
@@ -276,6 +317,14 @@ io.on("connection", (socket) => {
   socket.on("game:death", async ({ roomId } = {}) => {
     try {
       if (!roomId) return;
+      const r = rooms.get(roomId);
+      if (!r) return;
+
+      // Record survival time for this player
+      const survivalMs = Math.max(0, Date.now() - (r.startedAt || Date.now()));
+      if (!r.stats) r.stats = {};
+      r.stats[socket.id] = { survivalMs };
+
       await endRoom({ roomId, loserSid: socket.id, reason: "death" });
     } catch (e) {
       console.error("game:death error:", e);
@@ -286,6 +335,14 @@ io.on("connection", (socket) => {
   socket.on("game:forfeit", async ({ roomId } = {}) => {
     try {
       if (!roomId) return;
+      const r = rooms.get(roomId);
+      if (!r) return;
+
+      // Record survival time for this player
+      const survivalMs = Math.max(0, Date.now() - (r.startedAt || Date.now()));
+      if (!r.stats) r.stats = {};
+      r.stats[socket.id] = { survivalMs };
+
       await endRoom({ roomId, loserSid: socket.id, reason: "forfeit" });
     } catch (e) {
       console.error("game:forfeit error:", e);
@@ -388,6 +445,7 @@ io.on("connection", (socket) => {
         state: "found",
         seed: inv.seed,
         mode: "friend",
+        stats: {},
       });
 
       // join sockets into room
@@ -474,7 +532,12 @@ io.on("connection", (socket) => {
         if (r.state === "ended") continue;
         if (!r.players.includes(socket.id)) continue;
 
-        // ranked disconnect => loss -20; friend disconnect => no rank change
+        // Record survival time for disconnecting player
+        const survivalMs = Math.max(0, Date.now() - (r.startedAt || Date.now()));
+        if (!r.stats) r.stats = {};
+        r.stats[socket.id] = { survivalMs };
+
+        // ranked disconnect => loss; friend disconnect => no rank change
         await endRoom({ roomId, loserSid: socket.id, reason: "disconnect" });
       }
     } catch (e) {
