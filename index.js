@@ -1,0 +1,496 @@
+// server/index.js
+const express = require("express");
+const http = require("http");
+const cors = require("cors");
+const { Server } = require("socket.io");
+
+const authRoutes = require("./routes/auth");
+const meRoutes = require("./routes/me");
+const friendsRoutes = require("./routes/friends");
+const leaderboardRoutes = require("./routes/leaderboard");
+
+require("dotenv").config();
+const { connectDB } = require("./db");
+
+const Player = require("./models/Player");
+const { verifyToken } = require("./utils/jwt");
+const { getRank } = require("./utils/rank");
+
+const app = express();
+app.use(express.json());
+app.use(cors());
+
+app.use("/auth", authRoutes);
+app.use("/me", meRoutes);
+app.use("/friends", friendsRoutes);
+app.use("/leaderboard", leaderboardRoutes);
+
+app.get("/", (_, res) => res.send("Soul Duel server running"));
+
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: "*", methods: ["GET", "POST"] },
+});
+
+/* -------------------- HELPERS -------------------- */
+
+function clamp0(n) {
+  return Math.max(0, Number(n) || 0);
+}
+
+async function applyResult({ winnerPid, loserPid, mode }) {
+  // ✅ friend match: NO rank changes
+  if (mode !== "ranked") return;
+
+  const winner = await Player.findById(winnerPid);
+  const loser = await Player.findById(loserPid);
+  if (!winner || !loser) return;
+
+  winner.wins = clamp0(winner.wins) + 1;
+  loser.losses = clamp0(loser.losses) + 1;
+
+  winner.rating = clamp0(winner.rating) + 10;
+  loser.rating = clamp0(loser.rating) - 20;
+  if (loser.rating < 0) loser.rating = 0;
+
+  await winner.save();
+  await loser.save();
+}
+
+/**
+ * Ends a room for any reason (death/forfeit/disconnect).
+ * - Always emits matchOver (so both clients end).
+ * - Applies rating changes ONLY if room.mode === "ranked".
+ */
+async function endRoom({ roomId, loserSid, reason = "death" }) {
+  const r = rooms.get(roomId);
+  if (!r || r.state === "ended") return;
+
+  const [a, b] = r.players;
+  const winnerSid = loserSid === a ? b : a;
+
+  r.state = "ended";
+
+  // Get player IDs from stored room data
+  const loserPid = r.playerIds[r.players.indexOf(loserSid)];
+  const winnerPid = r.playerIds[r.players.indexOf(winnerSid)];
+
+  // ✅ ranked only
+  let winnerData = null;
+  let loserData = null;
+  if (winnerPid && loserPid && r.mode === "ranked") {
+    await applyResult({ winnerPid, loserPid, mode: r.mode });
+    // Fetch updated player data
+    const winnerPlayer = await Player.findById(winnerPid).lean();
+    const loserPlayer = await Player.findById(loserPid).lean();
+    if (winnerPlayer) {
+      winnerData = {
+        pid: winnerPlayer._id.toString(),
+        uid: winnerPlayer.uid,
+        username: winnerPlayer.username,
+        rating: winnerPlayer.rating || 0,
+        rank: getRank(winnerPlayer.rating || 0),
+        wins: winnerPlayer.wins || 0,
+        losses: winnerPlayer.losses || 0,
+      };
+    }
+    if (loserPlayer) {
+      loserData = {
+        pid: loserPlayer._id.toString(),
+        uid: loserPlayer.uid,
+        username: loserPlayer.username,
+        rating: loserPlayer.rating || 0,
+        rank: getRank(loserPlayer.rating || 0),
+        wins: loserPlayer.wins || 0,
+        losses: loserPlayer.losses || 0,
+      };
+    }
+  }
+
+  io.to(roomId).emit("game:matchOver", {
+    roomId,
+    winnerId: winnerSid,
+    loserId: loserSid,
+    endedAt: Date.now(),
+    reason,
+    mode: r.mode,
+    winner: winnerData,
+    loser: loserData,
+  });
+
+  setTimeout(() => rooms.delete(roomId), 15000);
+}
+
+/* -------------------- MATCHMAKING / ROOMS -------------------- */
+
+// ranked queue
+const queue = []; // socket.id list
+
+// roomId -> { players:[socketId,socketId], startedAt:number, state:"found"|"started"|"ended", seed:number, mode:"ranked"|"friend" }
+const rooms = new Map();
+
+function makeRoomId(a, b) {
+  return `room_${a.slice(0, 5)}_${b.slice(0, 5)}_${Date.now()}`;
+}
+
+function safeRemoveFromQueue(id) {
+  const idx = queue.indexOf(id);
+  if (idx !== -1) queue.splice(idx, 1);
+}
+
+/* -------------------- FRIEND INVITES (SOCKET) -------------------- */
+
+// uid -> socketId
+const onlineByUid = new Map();
+
+// inviteId -> { fromUid, toUid, seed, createdAt }
+const invites = new Map();
+
+function makeInviteId() {
+  return `inv_${Math.random().toString(36).slice(2, 10)}_${Date.now()}`;
+}
+
+// cleanup old invites
+setInterval(() => {
+  const now = Date.now();
+  for (const [inviteId, inv] of invites.entries()) {
+    if (now - inv.createdAt > 2 * 60 * 1000) invites.delete(inviteId);
+  }
+}, 30 * 1000);
+
+/* -------------------- SOCKET AUTH -------------------- */
+
+io.use(async (socket, next) => {
+  try {
+    const token = socket.handshake.auth?.token;
+    if (!token) return next(new Error("no_token"));
+
+    const decoded = verifyToken(token); // you sign { pid, uid }
+    const playerId = decoded.playerId || decoded.pid;
+    if (!playerId) return next(new Error("bad_token_payload"));
+
+    const player = await Player.findById(playerId).lean();
+    if (!player) return next(new Error("no_player"));
+
+    socket.player = {
+      id: String(player._id),
+      uid: player.uid,
+      username: player.username,
+      email: player.email,
+      rating: player.rating || 0,
+      rank: getRank(player.rating || 0),
+    };
+
+    next();
+  } catch (e) {
+    next(new Error("bad_token"));
+  }
+});
+
+/* -------------------- SOCKET EVENTS -------------------- */
+
+io.on("connection", (socket) => {
+  socket.emit("server:hello", { id: socket.id });
+
+  // mark online
+  if (socket.player?.uid) onlineByUid.set(socket.player.uid, socket.id);
+
+  /* -------------------- RANKED MATCHMAKING -------------------- */
+  socket.on("matchmaking:join", ({ mode } = {}) => {
+    // allow client to pass mode; default ranked
+    const wantedMode = mode === "friend" ? "friend" : "ranked";
+
+    // We only use queue for ranked.
+    if (wantedMode !== "ranked") return;
+
+    safeRemoveFromQueue(socket.id);
+
+    // if already in active room, ignore
+    for (const [, r] of rooms.entries()) {
+      if (r.players.includes(socket.id) && r.state !== "ended") return;
+    }
+
+    queue.push(socket.id);
+
+    if (queue.length >= 2) {
+      const p1 = queue.shift();
+      const p2 = queue.shift();
+      const roomId = makeRoomId(p1, p2);
+
+      const startAt = Date.now() + 5000;
+      const seed = Math.floor(Math.random() * 1e9);
+
+      rooms.set(roomId, {
+        players: [p1, p2],
+        playerIds: [
+          io.sockets.sockets.get(p1)?.player?.id || null,
+          io.sockets.sockets.get(p2)?.player?.id || null,
+        ],
+        startedAt: startAt,
+        state: "found",
+        seed,
+        mode: "ranked",
+      });
+
+      io.sockets.sockets.get(p1)?.join(roomId);
+      io.sockets.sockets.get(p2)?.join(roomId);
+
+      const s1 = io.sockets.sockets.get(p1)?.player;
+      const s2 = io.sockets.sockets.get(p2)?.player;
+
+      io.to(roomId).emit("matchFound", {
+        roomId,
+        startAt,
+        seed,
+        mode: "ranked",
+        p1: s1
+          ? { uid: s1.uid, username: s1.username, rating: s1.rating, rank: s1.rank }
+          : undefined,
+        p2: s2
+          ? { uid: s2.uid, username: s2.username, rating: s2.rating, rank: s2.rank }
+          : undefined,
+      });
+
+      setTimeout(() => {
+        const r = rooms.get(roomId);
+        if (!r || r.state === "ended") return;
+        r.state = "started";
+
+        io.to(roomId).emit("game:start", {
+          roomId,
+          startAt: r.startedAt,
+          seed: r.seed,
+          mode: r.mode,
+        });
+      }, Math.max(0, startAt - Date.now()));
+    }
+  });
+
+  socket.on("matchmaking:leave", () => {
+    safeRemoveFromQueue(socket.id);
+  });
+
+  /* -------------------- GAME ENDING EVENTS -------------------- */
+
+  // ✅ HP reached 0 => end match
+  socket.on("game:death", async ({ roomId } = {}) => {
+    try {
+      if (!roomId) return;
+      await endRoom({ roomId, loserSid: socket.id, reason: "death" });
+    } catch (e) {
+      console.error("game:death error:", e);
+    }
+  });
+
+  // ✅ Ranked exit => forfeit (loss -20). Friend => no rank change (server checks mode)
+  socket.on("game:forfeit", async ({ roomId } = {}) => {
+    try {
+      if (!roomId) return;
+      await endRoom({ roomId, loserSid: socket.id, reason: "forfeit" });
+    } catch (e) {
+      console.error("game:forfeit error:", e);
+    }
+  });
+
+  /* -------------------- FRIEND INVITES -------------------- */
+
+  // send invite to a UID (online only for now)
+  socket.on("friend:invite", ({ toUid }) => {
+    try {
+      const from = socket.player;
+      if (!from?.uid) return;
+
+      const targetUid = String(toUid || "").trim().toUpperCase();
+      if (!targetUid || targetUid === from.uid) return;
+
+      const targetSocketId = onlineByUid.get(targetUid);
+      if (!targetSocketId) {
+        socket.emit("friend:invite:status", {
+          ok: false,
+          error: "friend_offline",
+          toUid: targetUid,
+        });
+        return;
+      }
+
+      const inviteId = makeInviteId();
+      const seed = Math.floor(Math.random() * 1e9);
+
+      invites.set(inviteId, {
+        fromUid: from.uid,
+        toUid: targetUid,
+        seed,
+        createdAt: Date.now(),
+      });
+
+      // notify receiver
+      io.to(targetSocketId).emit("friend:invite:received", {
+        inviteId,
+        from: {
+          uid: from.uid,
+          username: from.username,
+          rating: from.rating,
+          rank: from.rank,
+        },
+      });
+
+      // ack sender
+      socket.emit("friend:invite:status", {
+        ok: true,
+        status: "sent",
+        inviteId,
+        toUid: targetUid,
+      });
+    } catch (e) {
+      console.error("friend:invite error:", e);
+      socket.emit("friend:invite:status", { ok: false, error: "server_error" });
+    }
+  });
+
+  // accept invite => match starts automatically after 5 seconds ✅ (your requirement)
+  socket.on("friend:invite:accept", ({ inviteId }) => {
+    try {
+      const me = socket.player;
+      const inv = invites.get(inviteId);
+
+      if (!me?.uid) {
+        socket.emit("friend:invite:status", { ok: false, error: "unauthorized" });
+        return;
+      }
+      if (!inv) {
+        socket.emit("friend:invite:status", { ok: false, error: "invite_not_found" });
+        return;
+      }
+      if (inv.toUid !== me.uid) {
+        socket.emit("friend:invite:status", { ok: false, error: "not_yours" });
+        return;
+      }
+
+      const fromSocketId = onlineByUid.get(inv.fromUid);
+      if (!fromSocketId) {
+        socket.emit("friend:invite:status", { ok: false, error: "sender_offline" });
+        invites.delete(inviteId);
+        return;
+      }
+
+      // ✅ always start 5 seconds after ACCEPT (prevents instant start)
+      const startAt = Date.now() + 5000;
+      const roomId = `friend_${inv.fromUid}_${inv.toUid}_${Date.now()}`;
+
+      // register room so death/forfeit/disconnect works
+      rooms.set(roomId, {
+        players: [fromSocketId, socket.id],
+        playerIds: [
+          io.sockets.sockets.get(fromSocketId)?.player?.id || null,
+          socket.player?.id || null,
+        ],
+        startedAt: startAt,
+        state: "found",
+        seed: inv.seed,
+        mode: "friend",
+      });
+
+      // join sockets into room
+      io.sockets.sockets.get(fromSocketId)?.join(roomId);
+      socket.join(roomId);
+
+      const fromSock = io.sockets.sockets.get(fromSocketId);
+      const p1 = fromSock?.player || { uid: inv.fromUid };
+      const p2 = socket.player || { uid: inv.toUid };
+
+      io.to(roomId).emit("matchFound", {
+        roomId,
+        startAt,
+        seed: inv.seed,
+        mode: "friend",
+        p1: { uid: p1.uid, username: p1.username, rating: p1.rating, rank: p1.rank },
+        p2: { uid: p2.uid, username: p2.username, rating: p2.rating, rank: p2.rank },
+      });
+
+      setTimeout(() => {
+        const r = rooms.get(roomId);
+        if (!r || r.state === "ended") return;
+        r.state = "started";
+
+        io.to(roomId).emit("game:start", {
+          roomId,
+          startAt: r.startedAt,
+          seed: r.seed,
+          mode: r.mode,
+        });
+      }, Math.max(0, startAt - Date.now()));
+
+      io.to(fromSocketId).emit("friend:invite:status", {
+        ok: true,
+        status: "accepted",
+        inviteId,
+      });
+
+      socket.emit("friend:invite:status", {
+        ok: true,
+        status: "accepted",
+        inviteId,
+      });
+
+      invites.delete(inviteId);
+    } catch (e) {
+      console.error("friend:invite:accept error:", e);
+      socket.emit("friend:invite:status", { ok: false, error: "server_error" });
+    }
+  });
+
+  socket.on("friend:invite:decline", ({ inviteId }) => {
+    try {
+      const me = socket.player;
+      const inv = invites.get(inviteId);
+      if (!me?.uid || !inv) return;
+      if (inv.toUid !== me.uid) return;
+
+      const fromSocketId = onlineByUid.get(inv.fromUid);
+      if (fromSocketId) {
+        io.to(fromSocketId).emit("friend:invite:status", {
+          ok: true,
+          status: "declined",
+          inviteId,
+        });
+      }
+
+      socket.emit("friend:invite:status", { ok: true, status: "declined", inviteId });
+      invites.delete(inviteId);
+    } catch (e) {
+      console.error("friend:invite:decline error:", e);
+    }
+  });
+
+  /* -------------------- DISCONNECT -------------------- */
+
+  socket.on("disconnect", async () => {
+    safeRemoveFromQueue(socket.id);
+    if (socket.player?.uid) onlineByUid.delete(socket.player.uid);
+
+    // If player was in ANY active room (ranked or friend), end it.
+    try {
+      for (const [roomId, r] of rooms.entries()) {
+        if (r.state === "ended") continue;
+        if (!r.players.includes(socket.id)) continue;
+
+        // ranked disconnect => loss -20; friend disconnect => no rank change
+        await endRoom({ roomId, loserSid: socket.id, reason: "disconnect" });
+      }
+    } catch (e) {
+      console.error("disconnect room end error:", e);
+    }
+  });
+});
+
+/* -------------------- BOOT -------------------- */
+
+connectDB()
+  .then(() => {
+    const PORT = process.env.PORT || 3001;
+    server.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+  })
+  .catch((err) => {
+    console.error("❌ DB connection failed:", err.message);
+    process.exit(1);
+  });
