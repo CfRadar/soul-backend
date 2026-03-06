@@ -9,6 +9,7 @@ const meRoutes = require("./routes/me");
 const friendsRoutes = require("./routes/friends");
 const leaderboardRoutes = require("./routes/leaderboard");
 const timeTrialRoutes = require("./routes/timeTrial");
+const bossesRoutes = require("./routes/bosses");
 
 require("dotenv").config();
 const { connectDB } = require("./db");
@@ -26,6 +27,7 @@ app.use("/me", meRoutes);
 app.use("/friends", friendsRoutes);
 app.use("/leaderboard", leaderboardRoutes);
 app.use("/time-trial", timeTrialRoutes);
+app.use("/bosses", bossesRoutes);
 
 app.get("/", (_, res) => res.send("Soul Duel server running"));
 
@@ -271,6 +273,12 @@ io.on("connection", (socket) => {
         seed,
         mode: "ranked",
         stats: {},
+        radiance: {
+          active: false,
+          startedAt: 0,
+          durationMs: 60000,
+          finished: {}
+        }
       });
 
       io.sockets.sockets.get(p1)?.join(roomId);
@@ -346,6 +354,49 @@ io.on("connection", (socket) => {
       await endRoom({ roomId, loserSid: socket.id, reason: "forfeit" });
     } catch (e) {
       console.error("game:forfeit error:", e);
+    }
+  });
+
+  /* -------------------- RADIANCE BOSS SYNC (RANKED ONLY) -------------------- */
+  socket.on("radiance:finished", ({ roomId } = {}) => {
+    try {
+      if (!roomId) return;
+      const r = rooms.get(roomId);
+      if (!r) return;
+      
+      // Ensure socket is actually in this room
+      if (!r.players.includes(socket.id)) return;
+      
+      // We only care about rank mode syncs
+      if (r.mode !== "ranked") return;
+
+      // Mark this specific socket as finished
+      if (!r.radiance) {
+        r.radiance = { active: false, startedAt: 0, durationMs: 60000, finished: {} };
+      }
+      
+      // If already finished, ignore duplicate emits
+      if (r.radiance.finished[socket.id]) return;
+      
+      r.radiance.active = true;
+      r.radiance.finished[socket.id] = true;
+
+      // Check if BOTH players are finished
+      const allDone = r.players.every((pid) => r.radiance.finished[pid] === true);
+
+      if (allDone) {
+        r.radiance.active = false;
+        // Broadcast to entire room that normal gameplay resumes
+        io.to(roomId).emit("radiance:resumeNormal", {
+          roomId,
+          resumeAt: Date.now() + 1000 // 1 second buffer for visual clarity
+        });
+      } else {
+        // Only one finished, tell them to wait
+        socket.emit("radiance:wait", { roomId });
+      }
+    } catch (e) {
+      console.error("radiance:finished error:", e);
     }
   });
 

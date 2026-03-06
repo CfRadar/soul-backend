@@ -18,6 +18,9 @@ const PlayerSchema = new mongoose.Schema(
     // time trial - best survival time in milliseconds
     bestTimeTrialMs: { type: Number, default: 0, min: 0 },
 
+    // unlocked bosses persistence
+    bossUnlocks: { type: [String], default: [] },
+
     // quick stats
     lastSeenAt: { type: Date, default: null },
   },
