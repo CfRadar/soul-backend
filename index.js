@@ -273,6 +273,10 @@ io.on("connection", (socket) => {
         seed,
         mode: "ranked",
         stats: {},
+        hp: {
+          [p1]: 100,
+          [p2]: 100
+        },
         radiance: {
           active: false,
           startedAt: 0,
@@ -293,11 +297,11 @@ io.on("connection", (socket) => {
         seed,
         mode: "ranked",
         p1: s1
-          ? { uid: s1.uid, username: s1.username, rating: s1.rating, rank: s1.rank }
-          : undefined,
+          ? { uid: s1.uid, username: s1.username, rating: s1.rating, rank: s1.rank, socketId: p1 }
+          : { socketId: p1 },
         p2: s2
-          ? { uid: s2.uid, username: s2.username, rating: s2.rating, rank: s2.rank }
-          : undefined,
+          ? { uid: s2.uid, username: s2.username, rating: s2.rating, rank: s2.rank, socketId: p2 }
+          : { socketId: p2 },
       });
 
       setTimeout(() => {
@@ -311,6 +315,12 @@ io.on("connection", (socket) => {
           seed: r.seed,
           mode: r.mode,
         });
+
+        // Send initial HP
+        io.to(roomId).emit("game:hpInit", { 
+          hpMap: r.hp || {}, 
+          maxHpMap: { [r.players[0]]: 100, [r.players[1]]: 100 } 
+        });
       }, Math.max(0, startAt - Date.now()));
     }
   });
@@ -320,6 +330,31 @@ io.on("connection", (socket) => {
   });
 
   /* -------------------- GAME ENDING EVENTS -------------------- */
+  
+  socket.on("game:hpUpdate", ({ roomId, hp, maxHp }) => {
+    try {
+      if (!roomId) return;
+      const r = rooms.get(roomId);
+      if (!r || r.state === "ended") return;
+      if (!r.players.includes(socket.id)) return;
+      
+      // We only care about rank mode syncs (or friend if we add it)
+      if (r.mode !== "ranked" && r.mode !== "friend") return;
+      
+      // Sanitize the HP value safely
+      if (typeof hp !== "number" || isNaN(hp)) return;
+      const cleanHp = Math.max(0, hp);
+      const cleanMaxHp = (typeof maxHp === "number" && !isNaN(maxHp)) ? Math.max(10, maxHp) : 100;
+      
+      if (!r.hp) r.hp = {};
+      r.hp[socket.id] = cleanHp;
+      
+      // Target sync cleanly only to the opponents inside the room securely
+      socket.to(roomId).emit("game:hpSync", { socketId: socket.id, hp: cleanHp, maxHp: cleanMaxHp });
+    } catch (e) {
+      console.error("game:hpUpdate error:", e);
+    }
+  });
 
   // ✅ HP reached 0 => end match
   socket.on("game:death", async ({ roomId } = {}) => {
@@ -497,6 +532,10 @@ io.on("connection", (socket) => {
         seed: inv.seed,
         mode: "friend",
         stats: {},
+        hp: {
+          [fromSocketId]: 100,
+          [socket.id]: 100
+        },
       });
 
       // join sockets into room
@@ -512,8 +551,8 @@ io.on("connection", (socket) => {
         startAt,
         seed: inv.seed,
         mode: "friend",
-        p1: { uid: p1.uid, username: p1.username, rating: p1.rating, rank: p1.rank },
-        p2: { uid: p2.uid, username: p2.username, rating: p2.rating, rank: p2.rank },
+        p1: { uid: p1.uid, username: p1.username, rating: p1.rating, rank: p1.rank, socketId: fromSocketId },
+        p2: { uid: p2.uid, username: p2.username, rating: p2.rating, rank: p2.rank, socketId: socket.id },
       });
 
       setTimeout(() => {
@@ -526,6 +565,10 @@ io.on("connection", (socket) => {
           startAt: r.startedAt,
           seed: r.seed,
           mode: r.mode,
+        });
+        io.to(roomId).emit("game:hpInit", { 
+          hpMap: r.hp || {}, 
+          maxHpMap: { [r.players[0]]: 100, [r.players[1]]: 100 } 
         });
       }, Math.max(0, startAt - Date.now()));
 
