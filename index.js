@@ -435,6 +435,49 @@ io.on("connection", (socket) => {
     }
   });
 
+  /* -------------------- GODDESS BOSS SYNC (RANKED ONLY) -------------------- */
+  socket.on("goddess:finished", ({ roomId } = {}) => {
+    try {
+      if (!roomId) return;
+      const r = rooms.get(roomId);
+      if (!r) return;
+      
+      // Ensure socket is actually in this room
+      if (!r.players.includes(socket.id)) return;
+      
+      // We only care about rank mode syncs
+      if (r.mode !== "ranked") return;
+
+      // Mark this specific socket as finished
+      if (!r.goddess) {
+        r.goddess = { active: false, startedAt: 0, durationMs: 60000, finished: {} };
+      }
+      
+      // If already finished, ignore duplicate emits
+      if (r.goddess.finished[socket.id]) return;
+      
+      r.goddess.active = true;
+      r.goddess.finished[socket.id] = true;
+
+      // Check if BOTH players are finished
+      const allDone = r.players.every((pid) => r.goddess.finished[pid] === true);
+
+      if (allDone) {
+        r.goddess.active = false;
+        // Broadcast to entire room that normal gameplay resumes
+        io.to(roomId).emit("goddess:resumeNormal", {
+          roomId,
+          resumeAt: Date.now() + 1000 // 1 second buffer for visual clarity
+        });
+      } else {
+        // Only one finished, tell them to wait
+        socket.emit("goddess:wait", { roomId });
+      }
+    } catch (e) {
+      console.error("goddess:finished error:", e);
+    }
+  });
+
   /* -------------------- FRIEND INVITES -------------------- */
 
   // send invite to a UID (online only for now)
