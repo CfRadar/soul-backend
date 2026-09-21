@@ -26,9 +26,11 @@ router.get("/list", requireAuth, async (req, res) => {
       .populate("friends", "uid username rating wins losses")
       .exec();
 
+    const onlineByUid = req.app.get("onlineByUid");
+
     return res.json({
       ok: true,
-      friends: (me?.friends || []).map(pub),
+      friends: (me?.friends || []).map((f) => pub(f, onlineByUid ? onlineByUid.has(f.uid) : false)),
     });
   } catch (e) {
     console.error("friends/list error:", e);
@@ -46,10 +48,12 @@ router.get("/requests", requireAuth, async (req, res) => {
       .populate("friendRequestsOut", "uid username rating wins losses")
       .exec();
 
+    const onlineByUid = req.app.get("onlineByUid");
+
     return res.json({
       ok: true,
-      incoming: (me?.friendRequestsIn || []).map(pub),
-      outgoing: (me?.friendRequestsOut || []).map(pub),
+      incoming: (me?.friendRequestsIn || []).map((f) => pub(f, onlineByUid ? onlineByUid.has(f.uid) : false)),
+      outgoing: (me?.friendRequestsOut || []).map((f) => pub(f, onlineByUid ? onlineByUid.has(f.uid) : false)),
     });
   } catch (e) {
     console.error("friends/requests error:", e);
@@ -57,15 +61,21 @@ router.get("/requests", requireAuth, async (req, res) => {
   }
 });
 
-// ✅ POST /friends/request  body: { uid }
+// ✅ POST /friends/request  body: { uid, username, or query }
 router.post("/request", requireAuth, async (req, res) => {
   try {
-    const uid = String(req.body.uid || "").trim().toUpperCase();
-    if (!uid) return res.status(400).json({ ok: false, error: "missing_uid" });
+    const rawQuery = String(req.body.query || req.body.username || req.body.uid || "").trim();
+    if (!rawQuery) return res.status(400).json({ ok: false, error: "missing_query" });
     if (!req.player?._id) return res.status(401).json({ ok: false, error: "unauthorized" });
 
     const me = await Player.findById(req.player._id);
-    const other = await Player.findOne({ uid });
+    const escaped = rawQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const other = await Player.findOne({
+      $or: [
+        { uid: rawQuery.toUpperCase() },
+        { username: new RegExp(`^${escaped}$`, "i") }
+      ]
+    });
 
     if (!other) return res.status(404).json({ ok: false, error: "no_user" });
     if (String(other._id) === String(me._id))
@@ -94,7 +104,7 @@ router.post("/request", requireAuth, async (req, res) => {
       await me.save();
       await other.save();
 
-      return res.json({ ok: true, status: "accepted", friend: pub(other) });
+      return res.json({ ok: true, status: "accepted", friend: pub(other, true) });
     }
 
     // normal request
@@ -104,22 +114,29 @@ router.post("/request", requireAuth, async (req, res) => {
     await me.save();
     await other.save();
 
-    return res.json({ ok: true, status: "requested" });
+    return res.json({ ok: true, status: "requested", target: pub(other) });
   } catch (e) {
     console.error("friends/request error:", e);
     return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
-// ✅ POST /friends/accept  body: { uid }
+// ✅ POST /friends/accept  body: { uid, username, or id }
 router.post("/accept", requireAuth, async (req, res) => {
   try {
-    const uid = String(req.body.uid || "").trim().toUpperCase();
-    if (!uid) return res.status(400).json({ ok: false, error: "missing_uid" });
+    const raw = String(req.body.uid || req.body.username || req.body.id || "").trim();
+    if (!raw) return res.status(400).json({ ok: false, error: "missing_target" });
     if (!req.player?._id) return res.status(401).json({ ok: false, error: "unauthorized" });
 
     const me = await Player.findById(req.player._id);
-    const other = await Player.findOne({ uid });
+    const escaped = raw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const other = await Player.findOne({
+      $or: [
+        { uid: raw.toUpperCase() },
+        { username: new RegExp(`^${escaped}$`, "i") },
+        ...(raw.match(/^[0-9a-fA-F]{24}$/) ? [{ _id: raw }] : [])
+      ]
+    });
     if (!other) return res.status(404).json({ ok: false, error: "no_user" });
 
     const hasReq = (me.friendRequestsIn || []).some((x) => String(x) === String(other._id));
@@ -136,22 +153,30 @@ router.post("/accept", requireAuth, async (req, res) => {
     await me.save();
     await other.save();
 
-    return res.json({ ok: true, friend: pub(other) });
+    const onlineByUid = req.app.get("onlineByUid");
+    return res.json({ ok: true, friend: pub(other, onlineByUid ? onlineByUid.has(other.uid) : false) });
   } catch (e) {
     console.error("friends/accept error:", e);
     return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
-// ✅ POST /friends/decline  body: { uid }
+// ✅ POST /friends/decline  body: { uid, username, or id }
 router.post("/decline", requireAuth, async (req, res) => {
   try {
-    const uid = String(req.body.uid || "").trim().toUpperCase();
-    if (!uid) return res.status(400).json({ ok: false, error: "missing_uid" });
+    const raw = String(req.body.uid || req.body.username || req.body.id || "").trim();
+    if (!raw) return res.status(400).json({ ok: false, error: "missing_target" });
     if (!req.player?._id) return res.status(401).json({ ok: false, error: "unauthorized" });
 
     const me = await Player.findById(req.player._id);
-    const other = await Player.findOne({ uid });
+    const escaped = raw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const other = await Player.findOne({
+      $or: [
+        { uid: raw.toUpperCase() },
+        { username: new RegExp(`^${escaped}$`, "i") },
+        ...(raw.match(/^[0-9a-fA-F]{24}$/) ? [{ _id: raw }] : [])
+      ]
+    });
     if (!other) return res.status(404).json({ ok: false, error: "no_user" });
 
     me.friendRequestsIn = (me.friendRequestsIn || []).filter((x) => String(x) !== String(other._id));

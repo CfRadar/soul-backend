@@ -22,6 +22,10 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
+// uid -> socketId (must be available to routes)
+const onlineByUid = new Map();
+app.set("onlineByUid", onlineByUid);
+
 app.use("/auth", authRoutes);
 app.use("/me", meRoutes);
 app.use("/friends", friendsRoutes);
@@ -180,23 +184,35 @@ function safeRemoveFromQueue(id) {
   if (idx !== -1) queue.splice(idx, 1);
 }
 
-/* -------------------- FRIEND INVITES (SOCKET) -------------------- */
-
-// uid -> socketId
-const onlineByUid = new Map();
+/* -------------------- FRIEND INVITES & CUSTOM ROOMS (SOCKET) -------------------- */
 
 // inviteId -> { fromUid, toUid, seed, createdAt }
 const invites = new Map();
+
+// code -> { code, hostSocketId, hostPlayer, createdAt }
+const customRoomsByCode = new Map();
+
+function generateRoomCode() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let code = "SD-";
+  for (let i = 0; i < 4; i++) {
+    code += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return code;
+}
 
 function makeInviteId() {
   return `inv_${Math.random().toString(36).slice(2, 10)}_${Date.now()}`;
 }
 
-// cleanup old invites
+// cleanup old invites and custom rooms
 setInterval(() => {
   const now = Date.now();
   for (const [inviteId, inv] of invites.entries()) {
     if (now - inv.createdAt > 2 * 60 * 1000) invites.delete(inviteId);
+  }
+  for (const [code, entry] of customRoomsByCode.entries()) {
+    if (now - entry.createdAt > 10 * 60 * 1000) customRoomsByCode.delete(code);
   }
 }, 30 * 1000);
 
@@ -235,7 +251,10 @@ io.on("connection", (socket) => {
   socket.emit("server:hello", { id: socket.id });
 
   // mark online
-  if (socket.player?.uid) onlineByUid.set(socket.player.uid, socket.id);
+  if (socket.player?.uid) {
+    onlineByUid.set(socket.player.uid, socket.id);
+    io.emit("player:statusChange", { uid: socket.player.uid, online: true });
+  }
 
   /* -------------------- RANKED MATCHMAKING -------------------- */
   socket.on("matchmaking:join", ({ mode } = {}) => {
@@ -353,6 +372,30 @@ io.on("connection", (socket) => {
       socket.to(roomId).emit("game:hpSync", { socketId: socket.id, hp: cleanHp, maxHp: cleanMaxHp });
     } catch (e) {
       console.error("game:hpUpdate error:", e);
+    }
+  });
+
+  /* -------------------- MULTIPLAYER REAL-TIME POSITION SYNC -------------------- */
+  socket.on("game:position", ({ roomId, x, y, isDashing, isGuarding, isHealing }) => {
+    try {
+      if (!roomId) return;
+      const r = rooms.get(roomId);
+      if (!r || r.state === "ended") return;
+      if (!r.players.includes(socket.id)) return;
+      if (typeof x !== "number" || isNaN(x) || typeof y !== "number" || isNaN(y)) return;
+
+      // Broadcast position and combat states to opponent in room
+      socket.to(roomId).emit("game:opponentPosition", {
+        socketId: socket.id,
+        x,
+        y,
+        isDashing: !!isDashing,
+        isGuarding: !!isGuarding,
+        isHealing: !!isHealing,
+        timestamp: Date.now()
+      });
+    } catch (e) {
+      console.error("game:position error:", e);
     }
   });
 
@@ -657,11 +700,178 @@ io.on("connection", (socket) => {
     }
   });
 
+  /* -------------------- CUSTOM ROOMS (BY ROOM CODE) -------------------- */
+
+  socket.on("room:create", (callback) => {
+    try {
+      if (!socket.player?.uid) {
+        if (typeof callback === "function") callback({ ok: false, error: "unauthorized" });
+        return;
+      }
+
+      // Clear any previous open room by this socket
+      for (const [c, entry] of customRoomsByCode.entries()) {
+        if (entry.hostSocketId === socket.id) customRoomsByCode.delete(c);
+      }
+
+      let code = "";
+      let attempts = 0;
+      do {
+        code = generateRoomCode();
+        attempts++;
+      } while (customRoomsByCode.has(code) && attempts < 20);
+
+      customRoomsByCode.set(code, {
+        code,
+        hostSocketId: socket.id,
+        hostPlayer: socket.player,
+        createdAt: Date.now(),
+      });
+
+      socket.join(`roomcode_${code}`);
+
+      if (typeof callback === "function") {
+        callback({ ok: true, code });
+      } else {
+        socket.emit("room:created", { ok: true, code });
+      }
+    } catch (e) {
+      console.error("room:create error:", e);
+      if (typeof callback === "function") callback({ ok: false, error: "server_error" });
+    }
+  });
+
+  socket.on("room:join", ({ code }, callback) => {
+    try {
+      if (!socket.player?.uid) {
+        if (typeof callback === "function") callback({ ok: false, error: "unauthorized" });
+        return;
+      }
+
+      const cleanCode = String(code || "").trim().toUpperCase();
+      if (!cleanCode) {
+        if (typeof callback === "function") callback({ ok: false, error: "missing_code" });
+        return;
+      }
+
+      const entry = customRoomsByCode.get(cleanCode);
+      if (!entry) {
+        if (typeof callback === "function") callback({ ok: false, error: "Room not found. Check the code!" });
+        return;
+      }
+
+      if (entry.hostSocketId === socket.id) {
+        if (typeof callback === "function") callback({ ok: false, error: "You cannot join your own room." });
+        return;
+      }
+
+      const hostSocket = io.sockets.sockets.get(entry.hostSocketId);
+      if (!hostSocket) {
+        customRoomsByCode.delete(cleanCode);
+        if (typeof callback === "function") callback({ ok: false, error: "Host disconnected." });
+        return;
+      }
+
+      // Consume custom room
+      customRoomsByCode.delete(cleanCode);
+
+      const startAt = Date.now() + 5000;
+      const seed = Math.floor(Math.random() * 1e9);
+      const roomId = `friend_custom_${cleanCode}_${Date.now()}`;
+
+      rooms.set(roomId, {
+        players: [entry.hostSocketId, socket.id],
+        playerIds: [entry.hostPlayer?.id || null, socket.player?.id || null],
+        startedAt: startAt,
+        state: "found",
+        seed,
+        mode: "friend",
+        stats: {},
+        hp: {
+          [entry.hostSocketId]: 100,
+          [socket.id]: 100,
+        },
+      });
+
+      hostSocket.join(roomId);
+      socket.join(roomId);
+
+      const p1 = entry.hostPlayer || { uid: "HOST" };
+      const p2 = socket.player || { uid: "GUEST" };
+
+      const matchPayload = {
+        roomId,
+        startAt,
+        seed,
+        mode: "friend",
+        p1: { uid: p1.uid, username: p1.username, rating: p1.rating, rank: p1.rank, socketId: entry.hostSocketId },
+        p2: { uid: p2.uid, username: p2.username, rating: p2.rating, rank: p2.rank, socketId: socket.id },
+      };
+
+      io.to(roomId).emit("matchFound", matchPayload);
+
+      setTimeout(() => {
+        const r = rooms.get(roomId);
+        if (!r || r.state === "ended") return;
+        r.state = "started";
+
+        io.to(roomId).emit("game:start", {
+          roomId,
+          startAt: r.startedAt,
+          seed: r.seed,
+          mode: r.mode,
+        });
+        io.to(roomId).emit("game:hpInit", {
+          hpMap: r.hp || {},
+          maxHpMap: { [r.players[0]]: 100, [r.players[1]]: 100 },
+        });
+      }, Math.max(0, startAt - Date.now()));
+
+      if (typeof callback === "function") {
+        callback({ ok: true, roomId });
+      }
+    } catch (e) {
+      console.error("room:join error:", e);
+      if (typeof callback === "function") callback({ ok: false, error: "server_error" });
+    }
+  });
+
+  socket.on("room:cancel", ({ code } = {}, callback) => {
+    try {
+      for (const [c, entry] of customRoomsByCode.entries()) {
+        if (entry.hostSocketId === socket.id) {
+          customRoomsByCode.delete(c);
+        }
+      }
+      if (typeof callback === "function") callback({ ok: true });
+    } catch (e) {
+      console.error("room:cancel error:", e);
+    }
+  });
+
+  socket.on("friends:getOnline", (callback) => {
+    try {
+      const uids = Array.from(onlineByUid.keys());
+      if (typeof callback === "function") callback({ ok: true, onlineUids: uids });
+      else socket.emit("friends:onlineList", { onlineUids: uids });
+    } catch (e) {
+      console.error("friends:getOnline error:", e);
+    }
+  });
+
   /* -------------------- DISCONNECT -------------------- */
 
   socket.on("disconnect", async () => {
     safeRemoveFromQueue(socket.id);
-    if (socket.player?.uid) onlineByUid.delete(socket.player.uid);
+    if (socket.player?.uid) {
+      onlineByUid.delete(socket.player.uid);
+      io.emit("player:statusChange", { uid: socket.player.uid, online: false });
+    }
+
+    // Clean up any hosted custom room by this player
+    for (const [c, entry] of customRoomsByCode.entries()) {
+      if (entry.hostSocketId === socket.id) customRoomsByCode.delete(c);
+    }
 
     // If player was in ANY active room (ranked or friend), end it.
     try {
