@@ -5,6 +5,7 @@ const PlayerSchema = new mongoose.Schema(
     uid: { type: String, unique: true, index: true }, // secret friend code
     username: { type: String, required: true, unique: true, index: true },
     email: { type: String, required: true, unique: true, index: true },
+    password: { type: String, default: null },
 
     rating: { type: Number, default: 0, min: 0 },
 

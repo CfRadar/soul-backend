@@ -2,35 +2,41 @@ const express = require("express");
 const router = express.Router();
 const Player = require("../models/Player");
 const { requireAuth } = require("../middleware/auth");
-const { getRank } = require("../utils/rank");
+const { getTimeTrialRank, getTimeTrialTitle } = require("../utils/rank");
 
-// Helper to format player for public leaderboard (no email)
+// Helper to format player for public leaderboard with dedicated Time Trial ranks
 function pub(p, position) {
+  const timeMs = Number(p.bestTimeTrialMs || 0);
+  const ttRank = getTimeTrialRank(timeMs, position);
+  const ttTitle = getTimeTrialTitle(ttRank);
+
   return {
     position: position,
     uid: p.uid,
     username: p.username,
-    bestTimeTrialMs: Number(p.bestTimeTrialMs || 0),
+    bestTimeTrialMs: timeMs,
+    timeTrialRank: ttRank,
+    timeTrialTitle: ttTitle,
+    rank: ttRank, // For components that inspect rank field
     rating: Number(p.rating || 0),
-    rank: getRank(p.rating || 0),
     wins: Number(p.wins || 0),
     losses: Number(p.losses || 0),
   };
 }
 
 // ✅ GET /time-trial/leaderboard?limit=50
-// Returns top players sorted by bestTimeTrialMs desc, then rating desc, then updatedAt desc
+// Returns top players sorted by bestTimeTrialMs desc, then updatedAt desc
 router.get("/leaderboard", async (req, res) => {
   try {
     const limit = Math.min(Math.max(parseInt(req.query?.limit) || 50, 1), 200);
 
     const players = await Player.find({ bestTimeTrialMs: { $gt: 0 } })
-      .sort({ bestTimeTrialMs: -1, rating: -1, updatedAt: -1 })
+      .sort({ bestTimeTrialMs: -1, updatedAt: -1 })
       .limit(limit)
       .lean();
 
     // Add position to each player
-    const leaderboard = players.map((player, index) => 
+    const leaderboard = players.map((player, index) =>
       pub(player, index + 1)
     );
 
@@ -48,7 +54,7 @@ router.get("/leaderboard", async (req, res) => {
 // requireAuth
 // Body: { timeMs: number }
 // Only update if timeMs > player.bestTimeTrialMs
-// Response: { ok: true, bestTimeTrialMs, improved: boolean }
+// Response: { ok: true, bestTimeTrialMs, timeTrialRank, timeTrialTitle, improved: boolean }
 router.post("/submit", requireAuth, async (req, res) => {
   try {
     const { timeMs } = req.body;
@@ -77,9 +83,15 @@ router.post("/submit", requireAuth, async (req, res) => {
       await player.save();
     }
 
+    const finalBest = player.bestTimeTrialMs || 0;
+    const ttRank = getTimeTrialRank(finalBest);
+    const ttTitle = getTimeTrialTitle(ttRank);
+
     return res.json({
       ok: true,
-      bestTimeTrialMs: player.bestTimeTrialMs,
+      bestTimeTrialMs: finalBest,
+      timeTrialRank: ttRank,
+      timeTrialTitle: ttTitle,
       improved,
     });
   } catch (e) {
