@@ -43,6 +43,13 @@ app.use("/time-trial", timeTrialRoutes);
 app.use("/bosses", bossesRoutes);
 
 app.get("/", (_, res) => res.send("Soul Duel server running"));
+app.get("/online-count", (_, res) => {
+  res.json({
+    ok: true,
+    count: onlineByUid.size,
+    totalSockets: io?.engine?.clientsCount || io?.sockets?.sockets?.size || 0,
+  });
+});
 
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -262,11 +269,19 @@ io.use(async (socket, next) => {
 
 io.on("connection", (socket) => {
   socket.emit("server:hello", { id: socket.id });
+  socket.emit("server:onlineCount", { count: onlineByUid.size });
+
+  socket.on("server:getOnlineCount", (callback) => {
+    if (typeof callback === "function") {
+      callback({ ok: true, count: onlineByUid.size });
+    }
+  });
 
   // mark online
   if (socket.player?.uid) {
     onlineByUid.set(socket.player.uid, socket.id);
     io.emit("player:statusChange", { uid: socket.player.uid, online: true });
+    io.emit("server:onlineCount", { count: onlineByUid.size });
   }
 
   /* -------------------- RANKED MATCHMAKING -------------------- */
@@ -879,6 +894,7 @@ io.on("connection", (socket) => {
     if (socket.player?.uid) {
       onlineByUid.delete(socket.player.uid);
       io.emit("player:statusChange", { uid: socket.player.uid, online: false });
+      io.emit("server:onlineCount", { count: onlineByUid.size });
     }
 
     // Clean up any hosted custom room by this player
