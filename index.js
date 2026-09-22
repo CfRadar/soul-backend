@@ -19,8 +19,17 @@ const { verifyToken } = require("./utils/jwt");
 const { getRank } = require("./utils/rank");
 
 const app = express();
+
+const corsOptions = {
+  origin: true, // Dynamically allow whatever origin requested (e.g. https://soul-frontend-bice.vercel.app, localhost)
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept"],
+  optionsSuccessStatus: 200,
+};
+
+app.use(cors(corsOptions));
 app.use(express.json());
-app.use(cors());
 
 // uid -> socketId (must be available to routes)
 const onlineByUid = new Map();
@@ -37,7 +46,11 @@ app.get("/", (_, res) => res.send("Soul Duel server running"));
 
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: "*", methods: ["GET", "POST"] },
+  cors: {
+    origin: (origin, callback) => callback(null, true),
+    methods: ["GET", "POST"],
+    credentials: true,
+  },
 });
 
 /* -------------------- HELPERS -------------------- */
