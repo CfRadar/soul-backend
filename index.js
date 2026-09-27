@@ -20,8 +20,28 @@ const { getRank } = require("./utils/rank");
 
 const app = express();
 
+function isAllowedOrigin(origin) {
+  if (!origin) return true;
+  try {
+    const parsed = new URL(origin);
+    const host = parsed.hostname;
+    if (host === "localhost" || host === "127.0.0.1") return true;
+    if (host.endsWith(".vercel.app")) return true;
+    if (process.env.FRONTEND_URL && origin.startsWith(process.env.FRONTEND_URL)) return true;
+    return false;
+  } catch (e) {
+    return false;
+  }
+}
+
 const corsOptions = {
-  origin: true, // Dynamically allow whatever origin requested (e.g. https://soul-frontend-bice.vercel.app, localhost)
+  origin: (origin, callback) => {
+    if (isAllowedOrigin(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error("CORS blocked by anti-cheat policy"));
+    }
+  },
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept"],
@@ -54,7 +74,13 @@ app.get("/online-count", (_, res) => {
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: (origin, callback) => callback(null, true),
+    origin: (origin, callback) => {
+      if (isAllowedOrigin(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error("Socket connection blocked by anti-cheat policy"));
+      }
+    },
     methods: ["GET", "POST"],
     credentials: true,
   },
@@ -394,6 +420,9 @@ io.on("connection", (socket) => {
       const cleanMaxHp = (typeof maxHp === "number" && !isNaN(maxHp)) ? Math.max(10, maxHp) : 100;
       
       if (!r.hp) r.hp = {};
+      // Anti-Cheat: Prevent resurrecting once HP hit 0 in the room
+      if (r.hp[socket.id] === 0 && cleanHp > 0) return;
+
       r.hp[socket.id] = cleanHp;
       
       // Target sync cleanly only to the opponents inside the room securely
@@ -412,15 +441,37 @@ io.on("connection", (socket) => {
       if (!r.players.includes(socket.id)) return;
       if (typeof x !== "number" || isNaN(x) || typeof y !== "number" || isNaN(y)) return;
 
+      // Anti-Cheat: Arena boundaries clamping (980 x 540 arena)
+      const clampedX = Math.max(-50, Math.min(1050, x));
+      const clampedY = Math.max(-50, Math.min(600, y));
+
+      // Anti-Cheat: Velocity & Teleportation clamping
+      if (!r.positions) r.positions = {};
+      const prev = r.positions[socket.id];
+      const now = Date.now();
+
+      if (prev) {
+        const dt = (now - prev.time) / 1000;
+        if (dt > 0.04) {
+          const dist = Math.hypot(clampedX - prev.x, clampedY - prev.y);
+          const speed = dist / dt;
+          // Dash speed is 900 px/s; allow generous 2500 px/s for network lag packet bursts
+          if (speed > 2500) {
+            return; // Discard impossible teleport update
+          }
+        }
+      }
+      r.positions[socket.id] = { x: clampedX, y: clampedY, time: now };
+
       // Broadcast position and combat states to opponent in room
       socket.to(roomId).emit("game:opponentPosition", {
         socketId: socket.id,
-        x,
-        y,
+        x: clampedX,
+        y: clampedY,
         isDashing: !!isDashing,
         isGuarding: !!isGuarding,
         isHealing: !!isHealing,
-        timestamp: Date.now()
+        timestamp: now
       });
     } catch (e) {
       console.error("game:position error:", e);

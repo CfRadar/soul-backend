@@ -4,6 +4,20 @@ const Player = require("../models/Player");
 const { requireAuth } = require("../middleware/auth");
 const { getTimeTrialRank, getTimeTrialTitle } = require("../utils/rank");
 
+// In-memory active time trial sessions: sessionToken -> { playerId, startMs, createdAt }
+const crypto = require("crypto");
+const activeSessions = new Map();
+
+// Cleanup sessions older than 70 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, session] of activeSessions.entries()) {
+    if (now - session.createdAt > 70 * 60 * 1000) {
+      activeSessions.delete(token);
+    }
+  }
+}, 5 * 60 * 1000);
+
 // Helper to format player for public leaderboard with dedicated Time Trial ranks
 function pub(p, position) {
   const timeMs = Number(p.bestTimeTrialMs || 0);
@@ -50,20 +64,86 @@ router.get("/leaderboard", async (req, res) => {
   }
 });
 
+// ✅ POST /time-trial/start
+// requireAuth
+// Starts an authoritative time trial run session
+router.post("/start", requireAuth, async (req, res) => {
+  try {
+    const playerId = String(req.player._id);
+    const sessionToken = crypto.randomBytes(24).toString("hex");
+    const now = Date.now();
+
+    activeSessions.set(sessionToken, {
+      playerId,
+      startMs: now,
+      createdAt: now,
+    });
+
+    return res.json({
+      ok: true,
+      sessionToken,
+      startMs: now,
+    });
+  } catch (e) {
+    console.error("time-trial start error:", e);
+    return res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
 // ✅ POST /time-trial/submit
 // requireAuth
-// Body: { timeMs: number }
-// Only update if timeMs > player.bestTimeTrialMs
-// Response: { ok: true, bestTimeTrialMs, timeTrialRank, timeTrialTitle, improved: boolean }
+// Body: { timeMs: number, sessionToken?: string }
+// Validates actual server elapsed time against claimed timeMs
 router.post("/submit", requireAuth, async (req, res) => {
   try {
-    const { timeMs } = req.body;
-    const playerId = req.player._id;
+    const { timeMs, sessionToken } = req.body;
+    const playerId = String(req.player._id);
 
-    // Validate timeMs
+    // Validate timeMs format
     if (!Number.isFinite(timeMs) || timeMs < 0) {
       return res.status(400).json({ ok: false, error: "invalid_timeMs" });
     }
+
+    // Anti-Cheat: Validate run session token
+    if (!sessionToken) {
+      return res.status(400).json({
+        ok: false,
+        error: "missing_run_session",
+        message: "Time trial must be started via /time-trial/start"
+      });
+    }
+
+    const session = activeSessions.get(sessionToken);
+    if (!session) {
+      return res.status(400).json({
+        ok: false,
+        error: "invalid_or_expired_session",
+        message: "Run session expired or does not exist"
+      });
+    }
+
+    // Verify session owner
+    if (session.playerId !== playerId) {
+      return res.status(403).json({ ok: false, error: "unauthorized_session" });
+    }
+
+    // Calculate actual elapsed server time
+    const serverElapsedMs = Date.now() - session.startMs;
+    // Allow generous 4-second grace buffer for client countdown/transit latency
+    const maxAllowedMs = serverElapsedMs + 4000;
+
+    if (timeMs > maxAllowedMs) {
+      console.warn(`[AntiCheat] Time trial time inflation rejected for player ${playerId}: claimed ${timeMs}ms, server elapsed ${serverElapsedMs}ms`);
+      activeSessions.delete(sessionToken);
+      return res.status(400).json({
+        ok: false,
+        error: "time_manipulation_detected",
+        message: "Claimed survival time exceeds real elapsed time"
+      });
+    }
+
+    // Single-use token: consume immediately
+    activeSessions.delete(sessionToken);
 
     // Cap to sensible max (60 minutes)
     const maxMs = 60 * 60 * 1000;
